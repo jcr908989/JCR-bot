@@ -88,7 +88,7 @@ def obtener_historial(conn, limite=100):
     return [{'timestamp': r[1], 'url': r[2], 'tienda': r[3], 'estado': r[4], 'precio': r[5], 'precio_anterior': r[6], 'cambio_precio': r[7]} for r in rows]
 
 def parse_precio_num(precio_str):
-    if precio_str == "N/A" or not precio_str:
+    if precio_str == "N/A" or not precio_str or precio_str == "Ver en web":
         return None
     nums = re.findall(r'[\d]+[.,]?\d*', str(precio_str).replace(',', '.'))
     if nums:
@@ -97,82 +97,111 @@ def parse_precio_num(precio_str):
         except:
             return None
     return None
-        
+
 class BaseParser(ABC):
     @abstractmethod
     def parse(self, soup, html):
         pass
     def get_name(self, url):
         return url.split("/")[2] if len(url.split("/")) > 2 else url
-    def hay_bloqueo(self, texto):
-        palabras_bloqueo = ["venta bloqueada", "agotado", "out of stock", "sold out", "no disponible", "notify me", "avisame cuando", "sin stock", "producto no disponible", "temporalmente agotado"]
-        return any(pal in texto for pal in palabras_bloqueo)
+    def hay_bloqueo_fuerte(self, texto):
+        palabras = ["venta bloqueada", "agotado", "out of stock", "sold out", "no disponible", "unavailable", "sin stock", "out-of-stock", "temporalmente agotado", "producto no disponible", "avisame cuando", "avísame cuando", "notify me", "notificar", "proximamente", "próximamente", "coming soon", "en camino", "on the way", "reservado", "reserved", "no a la venta", "not for sale"]
+        return any(pal in texto for pal in palabras)
+    def requiere_login(self, texto):
+        palabras = ["inicia sesion", "inicia sesión", "log in", "login", "sign in", "registrate", "regístrate", "crea una cuenta"]
+        return any(pal in texto for pal in palabras)
+    def extraer_precio(self, html, soup):
+        patrones = [r'"price":\s*"?(\d+[.,]\d{2})"?', r'"priceAmount":\s*"?(\d+[.,]\d{2})"?', r'itemprop="price"[^>]*content="(\d+[.,]\d{2})"', r'class="[^"]*price[^"]*"[^>]*>\s*(\d+[.,]\d{2})\s*[€$£]', r'(\d+[.,]\d{2})\s*[€$£]', r'[€$£]\s*(\d+[.,]\d{2})']
+        for p in patrones:
+            match = re.search(p, html, re.IGNORECASE)
+            if match:
+                precio = match.group(1).strip()
+                try:
+                    num = float(precio.replace(',', '.'))
+                    if 1 <= num <= 10000:
+                        return precio + ' €'
+                except:
+                    pass
+        return None
     def hay_boton_anadir_real(self, soup):
-        botones = soup.find_all(['button', 'a', 'input', 'form'], class_=lambda x: x and any(kw in str(x).lower() for kw in ['cart', 'add', 'comprar', 'buy', 'submit']))
-        boton_id = soup.find(id=lambda x: x and any(kw in str(x).lower() for kw in ['add-to-cart', 'buy-now', 'comprar']))
-        if boton_id:
-            botones.append(boton_id)
-        for boton in botones:
-            texto_boton = boton.get_text(strip=True).lower()
-            if any(pal in texto_boton for pal in ['añadir', 'comprar', 'add to cart', 'buy', 'agregar']):
-                if not boton.get('disabled') and 'disabled' not in str(boton.get('class', [])):
-                    return True
+        zonas_producto = soup.find_all(['div', 'section', 'form'], class_=lambda x: x and any(kw in str(x).lower() for kw in ['product', 'buy', 'purchase', 'addtocart', 'add-to-cart', 'price-box', 'product-info']))
+        if zonas_producto:
+            for zona in zonas_producto:
+                botones = zona.find_all(['button', 'a', 'input'], class_=lambda x: x and any(kw in str(x).lower() for kw in ['add', 'cart', 'buy', 'comprar', 'submit']))
+                for boton in botones:
+                    texto = boton.get_text(strip=True).lower()
+                    if any(pal in texto for pal in ['añadir al carrito', 'add to cart', 'comprar', 'buy now', 'agregar']):
+                        if not boton.get('disabled'):
+                            return True
+        boton_directo = soup.find(id=lambda x: x and any(kw in str(x).lower() for kw in ['add-to-cart', 'buy-now', 'addtocart']))
+        if boton_directo and not boton_directo.get('disabled'):
+            return True
         return False
 
 class TCGFactoryParser(BaseParser):
     def parse(self, soup, html):
-        texto_completo = soup.get_text(separator=" ", strip=True).lower()
-        if self.hay_bloqueo(texto_completo):
-            return False, self._extraer_precio(html, soup)
-        if self.hay_boton_anadir_real(soup):
-            return True, self._extraer_precio(html, soup)
-        palabras_compra = ["añadir al carrito", "add to cart", "comprar ahora", "buy now"]
-        if any(pal in texto_completo for pal in palabras_compra):
-            return True, self._extraer_precio(html, soup)
-        return False, self._extraer_precio(html, soup)
-    def _extraer_precio(self, html, soup):
-        patrones = [r'(\d+[.,]\d{2}\s*[€$£])', r'([€$£]\s*\d+[.,]\d{2})', r'"price":"?(\d+[.,]\d{2})"?']
-        for p in patrones:
-            match = re.search(p, html, re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-        return "N/A"
+        texto = soup.get_text(separator=" ", strip=True).lower()
+        if self.hay_bloqueo_fuerte(texto):
+            return False, None
+        if self.requiere_login(texto) and not self.hay_boton_anadir_real(soup):
+            return False, None
+        precio = self.extraer_precio(html, soup)
+        boton_real = self.hay_boton_anadir_real(soup)
+        if precio and boton_real:
+            return True, precio
+        elif boton_real:
+            return True, "Ver en web"
+        else:
+            return False, precio
 
 class AmazonParser(BaseParser):
     def parse(self, soup, html):
         unavailable = soup.find(id='outOfStock') or soup.find(id='availability')
-        if unavailable and any(pal in unavailable.get_text().lower() for pal in ['no disponible', 'agotado', 'out of stock']):
-            return False, "N/A"
-        buy_box = soup.find(id='buy-now-button') or soup.find(id='add-to-cart-button')
-        precio = "N/A"
+        if unavailable:
+            texto_disp = unavailable.get_text().lower()
+            if any(p in texto_disp for p in ['no disponible', 'agotado', 'out of stock', 'unavailable']):
+                return False, None
+        precio = None
         price_whole = soup.find('span', class_='a-price-whole')
+        price_frac = soup.find('span', class_='a-price-fraction')
         if price_whole:
-            precio = price_whole.get_text(strip=True).replace('.', ',') + '€'
-        disponible = buy_box is not None
-        return disponible, precio
+            precio = price_whole.get_text(strip=True).replace('.', ',')
+            if price_frac:
+                precio += price_frac.get_text(strip=True)
+            precio += ' €'
+        buy_box = soup.find(id='buy-now-button') or soup.find(id='add-to-cart-button')
+        if buy_box and not buy_box.get('disabled'):
+            return True, precio
+        if precio:
+            return True, precio
+        return False, None
+
+class CardmarketParser(BaseParser):
+    def parse(self, soup, html):
+        texto = soup.get_text(separator=" ", strip=True).lower()
+        if self.hay_bloqueo_fuerte(texto):
+            return False, None
+        precio = self.extraer_precio(html, soup)
+        boton = self.hay_boton_anadir_real(soup)
+        if precio and boton:
+            return True, precio
+        return False, precio
 
 class GenericParser(BaseParser):
     def parse(self, soup, html):
-        texto_completo = soup.get_text(separator=" ", strip=True).lower()
-        if self.hay_bloqueo(texto_completo):
-            precio = self._extraer_precio(html)
-            return False, precio
-        if self.hay_boton_anadir_real(soup):
-            precio = self._extraer_precio(html)
+        texto = soup.get_text(separator=" ", strip=True).lower()
+        if self.hay_bloqueo_fuerte(texto):
+            return False, None
+        precio = self.extraer_precio(html, soup)
+        if not precio:
+            return False, None
+        boton = self.hay_boton_anadir_real(soup)
+        if boton:
             return True, precio
-        palabras_compra = ["añadir al carrito", "add to cart", "comprar", "buy now", "pre-order", "preventa"]
-        if any(pal in texto_completo for pal in palabras_compra):
-            precio = self._extraer_precio(html)
+        palabras_compra_contexto = ["añadir al carrito", "add to cart", "comprar ahora", "buy now"]
+        if any(pal in texto for pal in palabras_compra_contexto):
             return True, precio
-        precio = self._extraer_precio(html)
         return False, precio
-    def _extraer_precio(self, html):
-        patrones = [r'(\d+[.,]\d{2}\s*[€$£])', r'([€$£]\s*\d+[.,]\d{2})', r'"price":"?(\d+[.,]\d{2})"?']
-        for p in patrones:
-            match = re.search(p, html, re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-        return "N/A"
 
 class ParserFactory:
     @staticmethod
@@ -182,6 +211,10 @@ class ParserFactory:
             return TCGFactoryParser()
         if 'amazon' in domain:
             return AmazonParser()
+        if 'cardmarket' in domain:
+            return CardmarketParser()
+        if 'tcgplayer' in domain:
+            return GenericParser()
         return GenericParser()
 
 class Notifier:
@@ -219,27 +252,29 @@ def verificar_url(url, config):
             disponible, precio = parser.parse(soup, r.text)
             precio_anterior = obtener_precio_anterior(st.session_state.conn, url)
             cambio_precio = "Sin cambio"
-            precio_actual_num = parse_precio_num(precio)
-            precio_anterior_num = parse_precio_num(precio_anterior)
-            if precio_actual_num and precio_anterior_num and precio_anterior != "N/A":
-                diferencia_pct = ((precio_anterior_num - precio_actual_num) / precio_anterior_num) * 100
-                umbral = config.get('price_drop_threshold', 5)
-                if diferencia_pct >= umbral:
-                    cambio_precio = f"⬇️ -{diferencia_pct:.1f}%"
-                    msg = f"🔥 *¡BAJADA DE PRECIO!* 🔥\n\n🏪 {tienda.upper()}\n📦 {nombre}\n💸 Antes: {precio_anterior}\n💰 Ahora: {precio}\n📉 Descuento: {diferencia_pct:.1f}%\n🔗 {url}"
-                    enviar_notificacion(msg, config)
-                elif diferencia_pct <= -umbral:
-                    cambio_precio = f"⬆️ +{abs(diferencia_pct):.1f}%"
-                else:
-                    cambio_precio = "↔️ Estable"
+            if precio:
+                precio_actual_num = parse_precio_num(precio)
+                precio_anterior_num = parse_precio_num(precio_anterior)
+                if precio_actual_num and precio_anterior_num and precio_anterior != "N/A":
+                    diferencia_pct = ((precio_anterior_num - precio_actual_num) / precio_anterior_num) * 100
+                    umbral = config.get('price_drop_threshold', 5)
+                    if diferencia_pct >= umbral:
+                        cambio_precio = f"⬇️ -{diferencia_pct:.1f}%"
+                        msg = f"🔥 *¡BAJADA DE PRECIO!* 🔥\n\n🏪 {tienda.upper()}\n📦 {nombre}\n💸 Antes: {precio_anterior}\n💰 Ahora: {precio}\n📉 Descuento: {diferencia_pct:.1f}%\n🔗 {url}"
+                        enviar_notificacion(msg, config)
+                    elif diferencia_pct <= -umbral:
+                        cambio_precio = f"⬆️ +{abs(diferencia_pct):.1f}%"
+                    else:
+                        cambio_precio = "↔️ Estable"
             estado = "DISPONIBLE" if disponible else "AGOTADO"
+            precio_str = precio if precio else "N/A"
             if disponible:
-                msg = f"🚨 *¡STOCK!* 🚨\n🏪 {tienda.upper()}\n📦 {nombre}\n💰 {precio}\n🔗 {url}"
+                msg = f"🚨 *¡STOCK!* 🚨\n🏪 {tienda.upper()}\n📦 {nombre}\n💰 {precio_str}\n🔗 {url}"
                 enviar_notificacion(msg, config)
-            guardar_log(st.session_state.conn, url, tienda, estado, precio, precio_anterior, cambio_precio)
-            if precio != "N/A":
+            guardar_log(st.session_state.conn, url, tienda, estado, precio_str, precio_anterior, cambio_precio)
+            if precio:
                 actualizar_precio_actual(st.session_state.conn, url, precio)
-            return {'url': url, 'tienda': tienda, 'estado': estado, 'precio': precio, 'ok': True}
+            return {'url': url, 'tienda': tienda, 'estado': estado, 'precio': precio_str, 'ok': True}
         else:
             guardar_log(st.session_state.conn, url, 'error', f'HTTP_{r.status_code}', 'N/A')
             return {'url': url, 'tienda': 'error', 'estado': 'ERROR', 'ok': False}
@@ -251,7 +286,7 @@ def verificar_todas(lista_urls, config):
     for url in lista_urls:
         verificar_url(url, config)
     st.session_state.ultima_comprobacion = datetime.now().strftime("%H:%M:%S")
-        
+
 st.title("🎴 JCR Cards Bot Pro")
 st.markdown("##### Gestor de URLs · Multi-tienda · Alertas de precio")
 
